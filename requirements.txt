@@ -1,11 +1,16 @@
-ipykernel==6.23.1
-numpy==1.24.3
-tokenizers==0.13.3
-torch==2.0.1
-tqdm==4.65.0
-transformers==4.29.2
-datasets==2.15.0
-beautifulsoup4==4.12.2
-wandb==0.15.3
-hydra-core==1.3.2
-tensor-parallel==1.2.4
+# Updated for Python 3.11+ and Llama 3.2 compatibility
+ipykernel>=6.23.1
+numpy>=1.24.3
+tqdm>=4.65.0
+
+# Core ML packages - versions updated for compatibility
+torch>=2.1.0
+transformers>=4.44.0
+tokenizers>=0.15.0
+datasets>=2.15.0
+
+# Utilities
+beautifulsoup4>=4.12.2
+wandb>=0.15.3
+hydra-core>=1.3.2
+tensor-parallel>=1.2.4
