@@ -308,10 +308,10 @@ class BasicTrainer(object):
             
             # Add margin metrics
             metrics[f'margins_{train_test}/values'] = model_margin.cpu().numpy().tolist()
-            metrics[f'margins_{train_test}/mean'] = model_margin.mean().item()
-            metrics[f'margins_{train_test}/std'] = model_margin.std().item()
-            metrics[f'margins_{train_test}/min'] = model_margin.min().item()
-            metrics[f'margins_{train_test}/max'] = model_margin.max().item()
+            metrics[f'margins_{train_test}/mean'] = [model_margin.mean().item()]
+            metrics[f'margins_{train_test}/std'] = [model_margin.std().item()]
+            metrics[f'margins_{train_test}/min'] = [model_margin.min().item()]
+            metrics[f'margins_{train_test}/max'] = [model_margin.max().item()]
             
             if isinstance(beta_used, float):
                 beta_used_list_or_float = beta_used
