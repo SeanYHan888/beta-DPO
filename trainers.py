@@ -48,7 +48,7 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
                     reference_rejected_logps: torch.FloatTensor,
                     beta: float, loss_config, rank, world_size,
                     reference_free: bool = False,
-                    gap_mean=None, gap_std=None, loss_mean=None, loss_std=None) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+                    gap_mean=None, gap_std=None, loss_mean=None, loss_std=None) -> Tuple[Tuple[torch.FloatTensor, Optional[torch.FloatTensor]], torch.FloatTensor, torch.FloatTensor, Union[float, torch.FloatTensor], torch.FloatTensor]:
     """Compute the DPO loss for a batch of policy and reference model log probabilities.
 
     Args:
@@ -60,9 +60,13 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
         reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
 
     Returns:
-        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-        The losses tensor contains the DPO loss for each example in the batch.
-        The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
+        A tuple of five values: ((losses, mask), chosen_rewards, rejected_rewards, beta_used, model_margin).
+        - losses: DPO loss for each example in the batch
+        - mask: Optional mask for beta-DPO sample filtering (None for standard DPO)
+        - chosen_rewards: Implicit rewards for chosen responses
+        - rejected_rewards: Implicit rewards for rejected responses
+        - beta_used: Beta value used (may be adjusted in beta-DPO)
+        - model_margin: Difference between policy and reference log-ratios (detached)
     """
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
@@ -72,6 +76,7 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
 
     if loss_config.mode_loss == "beta_DPO":
         logits = pi_logratios - ref_logratios
+        model_margin = logits.detach()  # Compute margin for tracking
         # 1. select data
         A_gap = (policy_chosen_logps - reference_chosen_logps - policy_rejected_logps + reference_rejected_logps)
         A = all_gather_if_needed(A_gap.detach(), rank, world_size)
@@ -92,14 +97,15 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
         # return
         chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
         rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
-        return (losses, global_mask), chosen_rewards, rejected_rewards, beta_used
+        return (losses, global_mask), chosen_rewards, rejected_rewards, beta_used, model_margin
     else:
         logits = pi_logratios - ref_logratios
+        model_margin = logits.detach()  # Compute margin for tracking
         losses = -F.logsigmoid(beta * logits)
         # return
         chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
         rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
-        return (losses, None), chosen_rewards, rejected_rewards, beta
+        return (losses, None), chosen_rewards, rejected_rewards, beta, model_margin
 
 
 def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, average_log_prob: bool = False) -> torch.FloatTensor:
@@ -192,6 +198,10 @@ class BasicTrainer(object):
             self.gap_std = torch.zeros(1, device='cuda')
             self.loss_mean = torch.zeros(1, device='cuda')
             self.loss_std = torch.zeros(1, device='cuda')
+        
+        # Initialize margin tracking
+        self.train_margins = []
+        self.eval_margins = []
 
         self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
         rank0_print(f'Loaded train data iterator')
@@ -268,6 +278,8 @@ class BasicTrainer(object):
         metrics = {}
         train_test = 'train' if train else 'eval'
         global_mask = None
+        model_margin = None  # Initialize margin as None
+        
         if loss_config.name in {'dpo', 'ipo'}:
             policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
             with torch.no_grad():
@@ -289,7 +301,18 @@ class BasicTrainer(object):
 
             dpo_loss_result = preference_loss(
                 policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, gap_mean=self.gap_mean, gap_std=self.gap_std, loss_mean=self.loss_mean, loss_std=self.loss_std, **loss_kwargs)
-            (losses, global_mask), chosen_rewards, rejected_rewards, beta_used = dpo_loss_result
+            (losses, global_mask), chosen_rewards, rejected_rewards, beta_used, model_margin = dpo_loss_result
+            
+            # Gather model margin across all GPUs
+            model_margin = all_gather_if_needed(model_margin, self.rank, self.world_size)
+            
+            # Add margin metrics
+            metrics[f'margins_{train_test}/values'] = model_margin.cpu().numpy().tolist()
+            metrics[f'margins_{train_test}/mean'] = model_margin.mean().item()
+            metrics[f'margins_{train_test}/std'] = model_margin.std().item()
+            metrics[f'margins_{train_test}/min'] = model_margin.min().item()
+            metrics[f'margins_{train_test}/max'] = model_margin.max().item()
+            
             if isinstance(beta_used, float):
                 beta_used_list_or_float = beta_used
             else:
@@ -335,9 +358,10 @@ class BasicTrainer(object):
             masked_losses = losses * local_mask
             effective_loss_count = local_mask.sum()
             effective_loss_count = effective_loss_count if effective_loss_count > 0 else 1
-            return (masked_losses.sum() / effective_loss_count), metrics
+            return (masked_losses.sum() / effective_loss_count), metrics, model_margin
         else:
-            return losses.mean(), metrics
+            return losses.mean(), metrics, model_margin
+
 
     def train(self):
         """Begin either SFT or DPO training, with periodic evaluation."""
@@ -373,10 +397,15 @@ class BasicTrainer(object):
                 for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
                     local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
                     with torch.no_grad():
-                        _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
+                        _, eval_metrics, eval_margin = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
 
                     for k, v in eval_metrics.items():
                         all_eval_metrics[k].extend(v)
+                    
+                    # Accumulate eval margins
+                    if eval_margin is not None:
+                        self.eval_margins.extend(eval_margin.cpu().numpy().tolist())
+
 
                 if self.config.sample_during_eval:
                     if self.config.n_eval_model_samples < self.config.eval_batch_size:
@@ -430,11 +459,16 @@ class BasicTrainer(object):
             for microbatch_idx in range(self.config.gradient_accumulation_steps):
                 global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
                 local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
-                loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
+                loss, metrics, margin = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
                 (loss / self.config.gradient_accumulation_steps).backward()
 
                 for k, v in metrics.items():
                     batch_metrics[k].extend(v)
+                
+                # Accumulate train margins
+                if margin is not None:
+                    self.train_margins.extend(margin.cpu().numpy().tolist())
+
 
             grad_norm = self.clip_gradient()
             self.optimizer.step()
@@ -483,7 +517,7 @@ class BasicTrainer(object):
         }, output_path)
     
     def save(self, output_dir: Optional[str] = None, metrics: Optional[Dict] = None):
-        """Save policy, optimizer, and scheduler state to disk."""
+        """Save policy, optimizer, scheduler, and margins to disk."""
 
         policy_state_dict = self.policy.state_dict()
         self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
@@ -495,6 +529,41 @@ class BasicTrainer(object):
 
         scheduler_state_dict = self.scheduler.state_dict()
         self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        
+        # Save margins to disk
+        if len(self.train_margins) > 0:
+            margin_dir = output_dir if output_dir else os.path.join(self.run_dir, 'LATEST')
+            os.makedirs(margin_dir, exist_ok=True)
+            margin_path = os.path.join(margin_dir, 'margins.json')
+            
+            margin_data = {
+                'train_margins': self.train_margins,
+                'eval_margins': self.eval_margins,
+                'step': self.example_counter,
+                'num_train_examples': len(self.train_margins),
+                'num_eval_examples': len(self.eval_margins),
+                'statistics': {
+                    'train_mean': float(np.mean(self.train_margins)),
+                    'train_std': float(np.std(self.train_margins)),
+                    'train_min': float(np.min(self.train_margins)),
+                    'train_max': float(np.max(self.train_margins)),
+                    'eval_mean': float(np.mean(self.eval_margins)) if self.eval_margins else None,
+                    'eval_std': float(np.std(self.eval_margins)) if self.eval_margins else None,
+                    'eval_min': float(np.min(self.eval_margins)) if self.eval_margins else None,
+                    'eval_max': float(np.max(self.eval_margins)) if self.eval_margins else None,
+                }
+            }
+            
+            rank0_print(f'Saving {len(self.train_margins)} train margins and {len(self.eval_margins)} eval margins to {margin_path}...')
+            with open(margin_path, 'w') as f:
+                json.dump(margin_data, f, indent=2)
+            
+            # Also save as numpy for easier analysis
+            np.save(os.path.join(margin_dir, 'margins_train.npy'), np.array(self.train_margins))
+            if self.eval_margins:
+                np.save(os.path.join(margin_dir, 'margins_eval.npy'), np.array(self.eval_margins))
+            rank0_print(f'Margins saved successfully!')
+
 
 
 class FSDPTrainer(BasicTrainer):
@@ -589,6 +658,41 @@ class FSDPTrainer(BasicTrainer):
             self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
         dist.barrier()
         
+        # Save margins (rank 0 only)
+        if self.rank == 0 and len(self.train_margins) > 0:
+            margin_dir = output_dir if output_dir else os.path.join(self.run_dir, 'LATEST')
+            os.makedirs(margin_dir, exist_ok=True)
+            margin_path = os.path.join(margin_dir, 'margins.json')
+            
+            margin_data = {
+                'train_margins': self.train_margins,
+                'eval_margins': self.eval_margins,
+                'step': self.example_counter,
+                'num_train_examples': len(self.train_margins),
+                'num_eval_examples': len(self.eval_margins),
+                'statistics': {
+                    'train_mean': float(np.mean(self.train_margins)),
+                    'train_std': float(np.std(self.train_margins)),
+                    'train_min': float(np.min(self.train_margins)),
+                    'train_max': float(np.max(self.train_margins)),
+                    'eval_mean': float(np.mean(self.eval_margins)) if self.eval_margins else None,
+                    'eval_std': float(np.std(self.eval_margins)) if self.eval_margins else None,
+                    'eval_min': float(np.min(self.eval_margins)) if self.eval_margins else None,
+                    'eval_max': float(np.max(self.eval_margins)) if self.eval_margins else None,
+                }
+            }
+            
+            rank0_print(f'Saving {len(self.train_margins)} train margins and {len(self.eval_margins)} eval margins to {margin_path}...')
+            with open(margin_path, 'w') as f:
+                json.dump(margin_data, f, indent=2)
+            
+            # Also save as numpy for easier analysis
+            np.save(os.path.join(margin_dir, 'margins_train.npy'), np.array(self.train_margins))
+            if self.eval_margins:
+                np.save(os.path.join(margin_dir, 'margins_eval.npy'), np.array(self.eval_margins))
+            rank0_print(f'Margins saved successfully!')
+        dist.barrier()
+
 
 class TensorParallelTrainer(BasicTrainer):
     def __init__(self, policy, config, seed, run_dir, reference_model=None, rank=0, world_size=1):
